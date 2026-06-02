@@ -260,11 +260,14 @@ if __name__ == "__main__":
         if args.parent_pid is not None and args.parent_pid <= 0:
             parser.error("--parent-pid must be a positive integer")
 
-        # Detect backend variant from binary name
-        # voicebox-server-cuda → sets VOICEBOX_BACKEND_VARIANT=cuda
+        # Detect backend variant from binary name unless the launcher already
+        # selected a specific CUDA variant such as cuda-pascal.
         import os
+        explicit_variant = os.environ.get("VOICEBOX_BACKEND_VARIANT")
         binary_name = os.path.basename(sys.executable).lower()
-        if "cuda" in binary_name:
+        if explicit_variant:
+            logger.info("Backend variant: %s", explicit_variant.upper())
+        elif "cuda" in binary_name:
             os.environ["VOICEBOX_BACKEND_VARIANT"] = "cuda"
             logger.info("Backend variant: CUDA")
         else:

@@ -430,7 +430,23 @@ def build_server(cuda=False):
         result = subprocess.run(
             [sys.executable, "-c", "import torch; print(torch.version.cuda or '')"], capture_output=True, text=True
         )
-        has_cuda_torch = bool(result.stdout.strip())
+        cuda_torch_version = result.stdout.strip()
+        has_cuda_torch = bool(cuda_torch_version)
+        restore_torch_args = [
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "--index-url",
+            "https://download.pytorch.org/whl/cu128",
+        ]
+        if cuda_torch_version.startswith("12.1"):
+            restore_torch_args = [
+                "torch==2.5.1",
+                "torchvision==0.20.1",
+                "torchaudio==2.5.1",
+                "--index-url",
+                "https://download.pytorch.org/whl/cu121",
+            ]
         if has_cuda_torch:
             logger.info("CUDA torch detected — installing CPU torch for CPU build...")
             subprocess.run(
@@ -461,19 +477,7 @@ def build_server(cuda=False):
             import subprocess
 
             subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "torch",
-                    "torchvision",
-                    "torchaudio",
-                    "--index-url",
-                    "https://download.pytorch.org/whl/cu128",
-                    "--force-reinstall",
-                    "-q",
-                ],
+                [sys.executable, "-m", "pip", "install", *restore_torch_args, "--force-reinstall", "-q"],
                 check=True,
             )
 

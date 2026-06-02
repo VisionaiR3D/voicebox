@@ -16,10 +16,13 @@ import hashlib
 import json
 import logging
 import os
+import platform
+import re
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypedDict
 
 from ..config import get_data_dir
 from ..utils.progress import get_progress_manager
@@ -27,13 +30,36 @@ from .. import __version__
 
 logger = logging.getLogger(__name__)
 
-GITHUB_RELEASES_URL = "https://github.com/jamiepine/voicebox/releases/download"
+GITHUB_RELEASES_URL = os.environ.get(
+    "VOICEBOX_CUDA_RELEASES_URL",
+    "https://github.com/VisionaiR3D/voicebox/releases/download",
+)
 
 PROGRESS_KEY = "cuda-backend"
 
-# The current expected CUDA libs version.  Bump this when we change the
-# CUDA toolkit version or torch's CUDA dependency changes (e.g. cu126 -> cu128).
-CUDA_LIBS_VERSION = "cu128-v1"
+class CudaVariant(TypedDict):
+    dir_name: str
+    server_archive: str
+    libs_version: str
+
+
+# The current expected CUDA backend variants.  Bump a libs_version when that
+# variant's CUDA toolkit version or torch dependency changes.
+CUDA_VARIANTS: dict[str, CudaVariant] = {
+    "cuda": {
+        "dir_name": "cuda",
+        "server_archive": "voicebox-server-cuda.tar.gz",
+        "libs_version": "cu128-v1",
+    },
+    "cuda-pascal": {
+        "dir_name": "cuda-pascal",
+        "server_archive": "voicebox-server-cuda-pascal.tar.gz",
+        "libs_version": "cu121-pascal-v1",
+    },
+}
+
+# Backwards-compatible name used by older callers/tests.
+CUDA_LIBS_VERSION = CUDA_VARIANTS["cuda"]["libs_version"]
 
 # Prevents concurrent download_cuda_binary() calls from racing on the same
 # temp file.  The auto-update background task and the manual HTTP endpoint
@@ -49,9 +75,67 @@ def get_backends_dir() -> Path:
     return d
 
 
-def get_cuda_dir() -> Path:
+def _windows_gpu_names() -> list[str]:
+    if platform.system() != "Windows":
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        logger.debug("Could not enumerate Windows GPUs: %s", e)
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _is_pascal_or_older_nvidia(name: str) -> bool:
+    """Return True for NVIDIA cards that need the legacy cu121 torch build."""
+    lower = name.lower()
+    if "nvidia" not in lower:
+        return False
+
+    # GeForce GTX 10-series cards are Pascal. The GTX 1080 reports compute
+    # capability 6.1, which modern cu128 PyTorch wheels no longer include.
+    if re.search(r"\bgtx\s*10\d{2}\b", lower):
+        return True
+
+    pascal_markers = (
+        "titan x",
+        "titan xp",
+        "quadro p",
+        "tesla p",
+        "mx150",
+        "mx250",
+    )
+    return any(marker in lower for marker in pascal_markers)
+
+
+def get_preferred_cuda_variant() -> str:
+    """Select the CUDA backend variant that best matches the installed GPU."""
+    for name in _windows_gpu_names():
+        if _is_pascal_or_older_nvidia(name):
+            return "cuda-pascal"
+    return "cuda"
+
+
+def get_cuda_variant_config(variant: Optional[str] = None) -> CudaVariant:
+    selected = variant or get_preferred_cuda_variant()
+    return CUDA_VARIANTS.get(selected, CUDA_VARIANTS["cuda"])
+
+
+def get_cuda_dir(variant: Optional[str] = None) -> Path:
     """Directory where the CUDA backend (onedir) is extracted."""
-    d = get_backends_dir() / "cuda"
+    d = get_backends_dir() / get_cuda_variant_config(variant)["dir_name"]
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -63,22 +147,22 @@ def get_cuda_exe_name() -> str:
     return "voicebox-server-cuda"
 
 
-def get_cuda_binary_path() -> Optional[Path]:
+def get_cuda_binary_path(variant: Optional[str] = None) -> Optional[Path]:
     """Return path to the CUDA executable if it exists inside the onedir."""
-    p = get_cuda_dir() / get_cuda_exe_name()
+    p = get_cuda_dir(variant) / get_cuda_exe_name()
     if p.exists():
         return p
     return None
 
 
-def get_cuda_libs_manifest_path() -> Path:
+def get_cuda_libs_manifest_path(variant: Optional[str] = None) -> Path:
     """Path to the cuda-libs.json manifest inside the CUDA dir."""
-    return get_cuda_dir() / "cuda-libs.json"
+    return get_cuda_dir(variant) / "cuda-libs.json"
 
 
-def get_installed_cuda_libs_version() -> Optional[str]:
+def get_installed_cuda_libs_version(variant: Optional[str] = None) -> Optional[str]:
     """Read the installed CUDA libs version from cuda-libs.json, or None."""
-    manifest_path = get_cuda_libs_manifest_path()
+    manifest_path = get_cuda_libs_manifest_path(variant)
     if not manifest_path.exists():
         return None
     try:
@@ -94,21 +178,25 @@ def is_cuda_active() -> bool:
 
     The CUDA binary sets this env var on startup (see server.py).
     """
-    return os.environ.get("VOICEBOX_BACKEND_VARIANT") == "cuda"
+    return os.environ.get("VOICEBOX_BACKEND_VARIANT", "").startswith("cuda")
 
 
 def get_cuda_status() -> dict:
     """Get current CUDA backend status for the API."""
     progress_manager = get_progress_manager()
-    cuda_path = get_cuda_binary_path()
+    variant = get_preferred_cuda_variant()
+    variant_config = get_cuda_variant_config(variant)
+    cuda_path = get_cuda_binary_path(variant)
     progress = progress_manager.get_progress(PROGRESS_KEY)
-    cuda_libs_version = get_installed_cuda_libs_version()
+    cuda_libs_version = get_installed_cuda_libs_version(variant)
 
     return {
         "available": cuda_path is not None,
         "active": is_cuda_active(),
+        "variant": variant,
         "binary_path": str(cuda_path) if cuda_path else None,
         "cuda_libs_version": cuda_libs_version,
+        "expected_cuda_libs_version": variant_config["libs_version"],
         "downloading": progress is not None and progress.get("status") == "downloading",
         "download_progress": progress,
     }
@@ -127,12 +215,13 @@ def _needs_server_download(version: Optional[str] = None) -> bool:
     return installed != expected
 
 
-def _needs_cuda_libs_download() -> bool:
+def _needs_cuda_libs_download(variant: Optional[str] = None) -> bool:
     """Check if the CUDA libs archive needs to be (re)downloaded."""
-    installed = get_installed_cuda_libs_version()
+    selected = variant or get_preferred_cuda_variant()
+    installed = get_installed_cuda_libs_version(selected)
     if installed is None:
         return True
-    return installed != CUDA_LIBS_VERSION
+    return installed != get_cuda_variant_config(selected)["libs_version"]
 
 
 async def _download_and_extract_archive(
@@ -263,17 +352,19 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
         version = f"v{__version__}"
 
     progress = get_progress_manager()
-    cuda_dir = get_cuda_dir()
+    variant = get_preferred_cuda_variant()
+    variant_config = get_cuda_variant_config(variant)
+    cuda_dir = get_cuda_dir(variant)
 
     need_server = _needs_server_download(version)
-    need_libs = _needs_cuda_libs_download()
+    need_libs = _needs_cuda_libs_download(variant)
 
     if not need_server and not need_libs:
         logger.info("CUDA backend is up to date, nothing to download")
         return
 
     logger.info(
-        f"Starting CUDA backend download for {version} "
+        f"Starting CUDA backend download for {version} ({variant}) "
         f"(server={'yes' if need_server else 'cached'}, "
         f"libs={'yes' if need_libs else 'cached'})"
     )
@@ -286,8 +377,8 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
     )
 
     base_url = f"{GITHUB_RELEASES_URL}/{version}"
-    server_archive = "voicebox-server-cuda.tar.gz"
-    libs_archive = f"cuda-libs-{CUDA_LIBS_VERSION}.tar.gz"
+    server_archive = variant_config["server_archive"]
+    libs_archive = f"cuda-libs-{variant_config['libs_version']}.tar.gz"
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
@@ -341,8 +432,8 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
                 )
 
                 # Write local cuda-libs.json manifest
-                manifest = {"version": CUDA_LIBS_VERSION}
-                get_cuda_libs_manifest_path().write_text(json.dumps(manifest, indent=2) + "\n")
+                manifest = {"version": variant_config["libs_version"], "variant": variant}
+                get_cuda_libs_manifest_path(variant).write_text(json.dumps(manifest, indent=2) + "\n")
 
         logger.info(f"CUDA backend ready at {cuda_dir}")
         progress.mark_complete(PROGRESS_KEY)
@@ -383,15 +474,19 @@ async def check_and_update_cuda_binary():
     Called on server startup. Checks both server version and CUDA libs
     version. Downloads only what's needed.
     """
-    cuda_path = get_cuda_binary_path()
+    variant = get_preferred_cuda_variant()
+    cuda_path = get_cuda_binary_path(variant)
     if not cuda_path:
         return  # No CUDA binary installed, nothing to update
 
     need_server = _needs_server_download()
-    need_libs = _needs_cuda_libs_download()
+    need_libs = _needs_cuda_libs_download(variant)
 
     if not need_server and not need_libs:
-        logger.info(f"CUDA binary is up to date (server=v{__version__}, libs={get_installed_cuda_libs_version()})")
+        logger.info(
+            f"CUDA binary is up to date "
+            f"(variant={variant}, server=v{__version__}, libs={get_installed_cuda_libs_version(variant)})"
+        )
         return
 
     reasons = []
@@ -399,8 +494,8 @@ async def check_and_update_cuda_binary():
         cuda_version = get_cuda_binary_version()
         reasons.append(f"server v{cuda_version} != v{__version__}")
     if need_libs:
-        installed_libs = get_installed_cuda_libs_version()
-        reasons.append(f"libs {installed_libs} != {CUDA_LIBS_VERSION}")
+        installed_libs = get_installed_cuda_libs_version(variant)
+        reasons.append(f"libs {installed_libs} != {get_cuda_variant_config(variant)['libs_version']}")
 
     logger.info(f"CUDA backend needs update ({', '.join(reasons)}). Auto-downloading...")
 
@@ -414,7 +509,7 @@ async def delete_cuda_binary() -> bool:
     """Delete the downloaded CUDA backend directory. Returns True if deleted."""
     import shutil
 
-    cuda_dir = get_cuda_dir()
+    cuda_dir = get_cuda_dir(get_preferred_cuda_variant())
     if cuda_dir.exists() and any(cuda_dir.iterdir()):
         shutil.rmtree(cuda_dir)
         logger.info(f"Deleted CUDA backend directory: {cuda_dir}")

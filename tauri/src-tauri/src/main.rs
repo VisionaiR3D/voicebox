@@ -24,6 +24,48 @@ pub const DICTATE_WINDOW_LABEL: &str = "dictate";
 const DICTATE_WINDOW_WIDTH: f64 = 420.0;
 const DICTATE_WINDOW_HEIGHT: f64 = 64.0;
 
+#[cfg(windows)]
+fn is_pascal_or_older_nvidia_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if !lower.contains("nvidia") {
+        return false;
+    }
+
+    let compact = lower.replace(' ', "");
+    compact.contains("gtx10")
+        || lower.contains("titan xp")
+        || lower.contains("titan x")
+        || lower.contains("quadro p")
+        || lower.contains("tesla p")
+        || lower.contains("mx150")
+        || lower.contains("mx250")
+}
+
+#[cfg(windows)]
+fn prefer_pascal_cuda_backend() -> bool {
+    match std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        ])
+        .output()
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(is_pascal_or_older_nvidia_name),
+        Err(e) => {
+            println!("Could not enumerate GPUs for CUDA backend selection: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn prefer_pascal_cuda_backend() -> bool {
+    false
+}
+
 /// Create the floating dictate webview hidden. The HotkeyMonitor shows it on
 /// chord-start; the frontend hides it when the capture pipeline finishes.
 /// Building it at setup avoids a race where the first chord or agent-speech
@@ -360,9 +402,16 @@ async fn start_server(
     println!("Data directory: {:?}", data_dir);
     println!("Remote mode: {}", remote.unwrap_or(false));
 
-    // Check for CUDA backend in data directory (onedir layout: backends/cuda/)
+    // Check for CUDA backend in data directory. Pascal/GTX 10-series cards
+    // need a cu121 PyTorch build, so they use backends/cuda-pascal instead
+    // of the default cu128 backend.
     let cuda_binary = {
-        let cuda_dir = data_dir.join("backends").join("cuda");
+        let preferred_variant = if prefer_pascal_cuda_backend() {
+            "cuda-pascal"
+        } else {
+            "cuda"
+        };
+        let cuda_dir = data_dir.join("backends").join(preferred_variant);
         let cuda_name = if cfg!(windows) {
             "voicebox-server-cuda.exe"
         } else {
@@ -402,12 +451,15 @@ async fn start_server(
             };
 
             if version_ok {
-                Some(exe_path)
+                Some((exe_path, preferred_variant.to_string()))
             } else {
                 None
             }
         } else {
-            println!("No CUDA backend found, using bundled CPU binary");
+            println!(
+                "No {} backend found, using bundled CPU binary",
+                preferred_variant
+            );
             None
         }
     };
@@ -468,11 +520,12 @@ async fn start_server(
     // If CUDA binary exists, launch it from the onedir directory.
     // .current_dir() is critical: PyInstaller onedir expects all DLLs and
     // support files (nvidia/, _internal/, etc.) relative to the exe.
-    let spawn_result = if let Some(ref cuda_path) = cuda_binary {
+    let spawn_result = if let Some((ref cuda_path, ref cuda_variant)) = cuda_binary {
         let cuda_dir = cuda_path.parent().unwrap();
         println!("Launching CUDA backend: {:?} (cwd: {:?})", cuda_path, cuda_dir);
         let mut cmd = app.shell().command(cuda_path.to_str().unwrap());
         cmd = cmd.current_dir(cuda_dir);
+        cmd = cmd.env("VOICEBOX_BACKEND_VARIANT", cuda_variant);
         cmd = cmd.args(["--data-dir", &data_dir_str, "--port", &port_str, "--parent-pid", &parent_pid_str]);
         if is_remote {
             cmd = cmd.args(["--host", "0.0.0.0"]);

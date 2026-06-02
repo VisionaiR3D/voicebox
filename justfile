@@ -72,8 +72,12 @@ setup-python:
     $gpus = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name
     Write-Host "Detected GPUs: $($gpus -join ', ')"
     $hasNvidia = ($gpus | Where-Object { $_ -match 'NVIDIA' }).Count -gt 0
+    $hasPascalNvidia = ($gpus | Where-Object { $_ -match 'NVIDIA' -and ($_ -match 'GTX\s*10\d{2}' -or $_ -match 'Titan Xp|Titan X|Quadro P|Tesla P|MX150|MX250') }).Count -gt 0
     $hasIntelArc = ($gpus | Where-Object { $_ -match 'Arc' }).Count -gt 0
-    if ($hasNvidia) { \
+    if ($hasPascalNvidia) { \
+        Write-Host "Pascal NVIDIA GPU detected - installing PyTorch 2.5.1 with CUDA 12.1 support..."; \
+        & "{{ pip }}" install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121; \
+    } elseif ($hasNvidia) { \
         Write-Host "NVIDIA GPU detected — installing PyTorch with CUDA support..."; \
         & "{{ pip }}" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128; \
     } elseif ($hasIntelArc) { \
@@ -226,9 +230,29 @@ build-server-cuda: _ensure-venv
     Copy-Item "backend/dist/voicebox-server-cuda/*" $dest -Recurse -Force; \
     Write-Host "Copied CUDA backend to $dest"
 
+# Build Pascal-compatible CUDA server binary and place in app data dir for local testing
+[windows]
+build-server-cuda-pascal: _ensure-venv
+    $ErrorActionPreference = "Stop"; \
+    $env:PATH = "{{ venv_bin }};$env:PATH"; \
+    Write-Host "Installing Pascal-compatible PyTorch 2.5.1 + CUDA 12.1..."; \
+    & "{{ pip }}" install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121 --force-reinstall; \
+    & "{{ python }}" backend/build_binary.py --cuda; \
+    if ($LASTEXITCODE -ne 0) { throw "build_binary.py --cuda failed with exit code $LASTEXITCODE" }; \
+    $dest = "$env:APPDATA/sh.voicebox.app/backends/cuda-pascal"; \
+    if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }; \
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null; \
+    Copy-Item "backend/dist/voicebox-server-cuda/*" $dest -Recurse -Force; \
+    Set-Content -Path "$dest/cuda-libs.json" -Value (@{ version = "cu121-pascal-v1"; variant = "cuda-pascal" } | ConvertTo-Json); \
+    Write-Host "Copied Pascal CUDA backend to $dest"
+
 # Build everything locally: CPU server + CUDA server + installable Tauri app
 [windows]
 build-local: build-server build-server-cuda build-tauri
+
+# Build everything locally with the Pascal-compatible CUDA backend
+[windows]
+build-local-pascal: build-server build-server-cuda-pascal build-tauri
 
 # Build Tauri desktop app
 [unix]

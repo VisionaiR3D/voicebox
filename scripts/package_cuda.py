@@ -10,6 +10,7 @@ Usage:
     python scripts/package_cuda.py backend/dist/voicebox-server-cuda/
     python scripts/package_cuda.py backend/dist/voicebox-server-cuda/ --output release-assets/
     python scripts/package_cuda.py backend/dist/voicebox-server-cuda/ --cuda-libs-version cu128-v1
+    python scripts/package_cuda.py backend/dist/voicebox-server-cuda/ --variant-name cuda-pascal --cuda-libs-version cu121-pascal-v1
 """
 
 import argparse
@@ -101,6 +102,7 @@ def package(
     output_dir: Path,
     cuda_libs_version: str,
     torch_compat: str,
+    variant_name: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,15 +142,16 @@ def package(
     # Create server core archive
     # Files are stored relative to the archive root (no parent directory prefix)
     # so extracting to backends/cuda/ puts everything at the right level.
-    server_archive = output_dir / "voicebox-server-cuda.tar.gz"
+    server_archive_name = "voicebox-server-cuda.tar.gz"
+    if variant_name != "cuda":
+        server_archive_name = f"voicebox-server-{variant_name}.tar.gz"
+    server_archive = output_dir / server_archive_name
     print(f"\nCreating server core archive: {server_archive.name}")
     with tarfile.open(server_archive, "w:gz") as tar:
         for rel_str, full_path in core_files:
             tar.add(full_path, arcname=rel_str)
     server_sha = sha256_file(server_archive)
-    (output_dir / "voicebox-server-cuda.tar.gz.sha256").write_text(
-        f"{server_sha}  voicebox-server-cuda.tar.gz\n"
-    )
+    (output_dir / f"{server_archive_name}.sha256").write_text(f"{server_sha}  {server_archive_name}\n")
     print(f"  Size: {server_archive.stat().st_size / (1024**2):.1f} MB")
     print(f"  SHA-256: {server_sha[:16]}...")
 
@@ -168,6 +171,7 @@ def package(
     # Write cuda-libs.json manifest
     manifest = {
         "version": cuda_libs_version,
+        "variant": variant_name,
         "torch_compat": torch_compat,
         "archive": cuda_libs_archive.name,
         "sha256": cuda_sha,
@@ -217,6 +221,12 @@ def main():
         default=">=2.7.0,<2.11.0",
         help="Torch version compatibility range (default: >=2.6.0,<2.11.0)",
     )
+    parser.add_argument(
+        "--variant-name",
+        type=str,
+        default="cuda",
+        help="CUDA backend variant name used in archive metadata (default: cuda)",
+    )
     args = parser.parse_args()
 
     if not args.input.is_dir():
@@ -225,7 +235,7 @@ def main():
         sys.exit(1)
 
     output_dir = args.output or args.input.parent
-    package(args.input, output_dir, args.cuda_libs_version, args.torch_compat)
+    package(args.input, output_dir, args.cuda_libs_version, args.torch_compat, args.variant_name)
 
 
 if __name__ == "__main__":
